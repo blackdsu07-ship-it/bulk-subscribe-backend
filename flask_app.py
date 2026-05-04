@@ -1,24 +1,13 @@
-# flask_app.py
-# ================================================================
-# Railway Flask backend — Universal Bulk Form Subscriber
-# Uses Playwright (headless browser) to handle JavaScript-rendered
-# forms that plain requests/BeautifulSoup cannot see.
-#
-# SETUP on Railway:
-#   requirements.txt should include:
-#     flask, flask-cors, playwright, gunicorn
-#
-#   Add this to your railway.toml or Dockerfile build command:
-#     playwright install chromium --with-deps
-# ================================================================
-
+# flask_app.py - Hybrid: fast requests first, Playwright fallback
 import re
 import logging
+import os
 from urllib.parse import urljoin, urlparse
 
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 app = Flask(__name__)
 CORS(app)
@@ -26,15 +15,25 @@ CORS(app)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+})
+
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
-# Keywords to identify form fields
 FIELD_HINTS = {
     "email":      ["email", "e-mail", "mail"],
     "first_name": ["first", "fname", "firstname", "given", "forename"],
     "last_name":  ["last",  "lname", "lastname",  "surname", "family"],
     "phone":      ["phone", "mobile", "tel", "cell", "contact"],
-    "name":       ["fullname", "full_name", "full-name", "yourname", "your_name"],
+    "name":       ["fullname", "full_name", "full-name", "yourname"],
 }
 
 SUCCESS_PHRASES = [
@@ -43,8 +42,7 @@ SUCCESS_PHRASES = [
     "signed up", "you have been", "added to", "on the list",
 ]
 ALREADY_PHRASES = ["already subscribed", "already on our list", "already registered"]
-ERROR_PHRASES   = ["invalid email", "please enter a valid", "something went wrong",
-                   "error", "failed", "please try again"]
+ERROR_PHRASES   = ["invalid email", "please enter a valid", "something went wrong"]
 
 
 def _normalize_url(url):
@@ -52,6 +50,10 @@ def _normalize_url(url):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     return url
+
+
+def _short_label(url):
+    return urlparse(url).netloc or url
 
 
 # ── /ping ─────────────────────────────────────────────────────
@@ -68,23 +70,14 @@ def detect():
     if not url:
         return jsonify({"ok": False, "message": "No URL provided"}), 400
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page    = _open_page(browser, url)
-            fields  = _detect_fields_pw(page)
-            browser.close()
-
-        if not fields:
+        soup, final_url = _fetch_page(url)
+        form, fields    = _find_best_form(soup, final_url)
+        if not form:
             return jsonify({"ok": False, "message": "No suitable form found on this page."})
-
-        readable = {k: v for k, v in fields.items()}
-        return jsonify({
-            "ok":      True,
-            "fields":  readable,
-            "message": f"Found form with {len(fields)} matching field(s).",
-        })
+        readable = {k: {"name": v.get("name",""), "type": v.get("type","text")} for k, v in fields.items()}
+        return jsonify({"ok": True, "fields": readable, "message": f"Found {len(fields)} field(s)."})
     except Exception as e:
-        log.error(f"detect error for {url}: {e}")
+        log.error(f"detect error: {e}")
         return jsonify({"ok": False, "message": str(e)}), 500
 
 
@@ -95,212 +88,246 @@ def bulk_subscribe():
     sites       = [_normalize_url(s) for s in body.get("sites", [])]
     subscribers = body.get("subscribers", [])
 
-    if not sites:
-        return jsonify({"error": "No sites provided"}), 400
-    if not subscribers:
-        return jsonify({"error": "No subscribers provided"}), 400
+    if not sites:       return jsonify({"error": "No sites provided"}), 400
+    if not subscribers: return jsonify({"error": "No subscribers provided"}), 400
 
     results = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+    for url in sites:
+        label = _short_label(url)
+        log.info(f"Processing: {url}")
 
-        for url in sites:
-            label = _short_label(url)
-            log.info(f"Processing site: {url}")
+        # Try fast method first
+        try:
+            soup, final_url = _fetch_page(url)
+            form, fields    = _find_best_form(soup, final_url)
+            use_playwright  = not form or "email" not in fields
+        except Exception as e:
+            log.warning(f"Fast fetch failed for {url}: {e}")
+            use_playwright = True
+            form = None
+            fields = {}
+            final_url = url
 
-            for sub in subscribers:
-                email = sub.get("email", "").strip()
-                if not email or not EMAIL_RE.match(email):
-                    continue
+        for sub in subscribers:
+            email = sub.get("email", "").strip()
+            if not email or not EMAIL_RE.match(email):
+                continue
+
+            if use_playwright:
+                status, reason = _try_playwright(url, sub)
+            else:
                 try:
-                    status, reason = _submit_with_playwright(browser, url, sub)
-                    log.info(f"[{status.upper()}] {email} -> {label}: {reason}")
-                    results.append({"email": email, "site": label, "status": status, "reason": reason})
+                    status, reason = _submit_form(form, fields, final_url, sub)
+                    # If fast method looks wrong, retry with Playwright
+                    if status == "skipped":
+                        status, reason = _try_playwright(url, sub)
                 except Exception as e:
-                    log.error(f"Error {email} -> {label}: {e}")
-                    results.append({"email": email, "site": label, "status": "error", "reason": str(e)[:120]})
+                    log.error(f"Submit error: {e}")
+                    status, reason = _try_playwright(url, sub)
 
-        browser.close()
+            log.info(f"[{status.upper()}] {email} -> {label}: {reason}")
+            results.append({"email": email, "site": label, "status": status, "reason": reason})
 
     ok_count = sum(1 for r in results if r["status"] == "success")
-    return jsonify({
-        "message": f"Done — {ok_count}/{len(results)} succeeded.",
-        "results": results,
-    })
+    return jsonify({"message": f"Done — {ok_count}/{len(results)} succeeded.", "results": results})
 
 
-# ════════════════════════════════════════════════════════════════
-#  PLAYWRIGHT HELPERS
-# ════════════════════════════════════════════════════════════════
+# ════════════════ FAST PATH (requests + BS4) ═════════════════
 
-def _open_page(browser, url):
-    """Open a page with realistic browser settings."""
-    ctx = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1280, "height": 800},
-        locale="en-US",
-    )
-    page = ctx.new_page()
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    # Wait a bit for JS-rendered forms to appear
-    page.wait_for_timeout(2500)
-    return page
+def _fetch_page(url):
+    r = SESSION.get(url, timeout=20, allow_redirects=True)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "lxml"), r.url
 
 
-def _detect_fields_pw(page):
-    """Find email/name/phone inputs on the page using Playwright."""
-    fields = {}
-
-    # Try to find email input
-    for sel in ['input[type="email"]', 'input[name*="email"]', 'input[id*="email"]',
-                'input[placeholder*="email" i]', 'input[placeholder*="Email" i]']:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            fields["email"] = sel
-            break
-
-    # First name
-    for sel in ['input[name*="first" i]', 'input[id*="first" i]',
-                'input[placeholder*="first" i]', 'input[autocomplete="given-name"]']:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            fields["first_name"] = sel
-            break
-
-    # Last name
-    for sel in ['input[name*="last" i]', 'input[id*="last" i]',
-                'input[placeholder*="last" i]', 'input[autocomplete="family-name"]']:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            fields["last_name"] = sel
-            break
-
-    # Phone
-    for sel in ['input[type="tel"]', 'input[name*="phone" i]', 'input[id*="phone" i]',
-                'input[placeholder*="phone" i]']:
-        el = page.query_selector(sel)
-        if el and el.is_visible():
-            fields["phone"] = sel
-            break
-
-    # Full name fallback
-    if "first_name" not in fields:
-        for sel in ['input[name*="name" i]', 'input[id*="name" i]',
-                    'input[placeholder*="name" i]', 'input[autocomplete="name"]']:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                fields["name"] = sel
-                break
-
-    return fields
+def _score_form(form):
+    score = 0
+    text  = form.get_text(" ").lower()
+    html  = str(form).lower()
+    for inp in form.find_all("input"):
+        if inp.get("type") == "email" or "email" in inp.get("name","").lower():
+            score += 10; break
+    for kw in ["subscribe","newsletter","sign up","signup","join","email"]:
+        if kw in text or kw in html: score += 2
+    if form.find(["button","input"], {"type": ["submit","button"]}): score += 3
+    for kw in ["login","password","search","comment","checkout"]:
+        if kw in text or kw in html: score -= 8
+    return score
 
 
-def _find_submit_button(page):
-    """Find the most likely submit button for a newsletter form."""
-    candidates = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button:has-text("Subscribe")',
-        'button:has-text("Sign Up")',
-        'button:has-text("Join")',
-        'button:has-text("Submit")',
-        'button:has-text("Get")',
-        '[role="button"]:has-text("Subscribe")',
-    ]
-    for sel in candidates:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                return el
-        except Exception:
-            continue
-    return None
+def _find_best_form(soup, base_url):
+    forms = soup.find_all("form")
+    if not forms: return None, {}
+    best = max(forms, key=_score_form)
+    if _score_form(best) < 5: return None, {}
+    return best, _map_fields(best)
 
 
-def _submit_with_playwright(browser, url, subscriber):
-    """
-    Open the page in a real headless browser, fill in the form,
-    submit it, and interpret the result.
-    """
-    page = _open_page(browser, url)
+def _map_fields(form):
+    inputs = [i for i in form.find_all("input")
+              if i.get("type","text") not in ("submit","button","checkbox","radio","file","image","reset")]
+    found = {}
+    for inp in inputs:
+        itype = inp.get("type","text").lower()
+        attrs = " ".join(filter(None,[
+            inp.get("name",""), inp.get("id",""), inp.get("placeholder",""),
+            inp.get("aria-label",""), inp.get("autocomplete",""),
+            " ".join(inp.get("class",[]) if isinstance(inp.get("class"), list) else [inp.get("class","")]),
+        ])).lower()
+        if "email" not in found and (itype=="email" or any(h in attrs for h in FIELD_HINTS["email"])):
+            found["email"] = inp; continue
+        if "first_name" not in found and any(h in attrs for h in FIELD_HINTS["first_name"]):
+            found["first_name"] = inp; continue
+        if "last_name" not in found and any(h in attrs for h in FIELD_HINTS["last_name"]):
+            found["last_name"] = inp; continue
+        if "phone" not in found and (itype=="tel" or any(h in attrs for h in FIELD_HINTS["phone"])):
+            found["phone"] = inp; continue
+        if "name" not in found and any(h in attrs for h in FIELD_HINTS["name"]):
+            found["name"] = inp
+    return found
+
+
+def _submit_form(form, fields, base, subscriber):
+    if "email" not in fields:
+        return "skipped", "email field not detected"
+    payload = {}
+    for hidden in form.find_all("input", {"type":"hidden"}):
+        if hidden.get("name"): payload[hidden["name"]] = hidden.get("value","")
+    field_map = {
+        "email":      subscriber.get("email",""),
+        "first_name": subscriber.get("first_name",""),
+        "last_name":  subscriber.get("last_name",""),
+        "phone":      subscriber.get("phone",""),
+        "name":       f"{subscriber.get('first_name','')} {subscriber.get('last_name','')}".strip(),
+    }
+    for key, el in fields.items():
+        name = el.get("name")
+        if name and field_map.get(key): payload[name] = field_map[key]
+    submit = form.find("input",{"type":"submit"}) or form.find("button",{"type":"submit"})
+    if submit and submit.get("name"): payload[submit["name"]] = submit.get("value","Submit")
+
+    action = urljoin(base, form.get("action", base))
+    method = form.get("method","post").strip().lower()
+    headers = {
+        "Referer": base,
+        "Origin": f"{urlparse(base).scheme}://{urlparse(base).netloc}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if method == "get":
+        r = SESSION.get(action, params=payload, headers=headers, timeout=20, allow_redirects=True)
+    else:
+        r = SESSION.post(action, data=payload, headers=headers, timeout=20, allow_redirects=True)
+    return _interpret_response(r)
+
+
+def _interpret_response(r):
+    if r.status_code >= 500: return "error", f"server error {r.status_code}"
+    text = r.text.lower()
+    for p in ALREADY_PHRASES:
+        if p in text: return "success", "already subscribed"
+    for p in SUCCESS_PHRASES:
+        if p in text: return "success", p
+    for p in ERROR_PHRASES:
+        if p in text: return "rejected", p
+    if r.status_code in (200,201,302): return "success", f"HTTP {r.status_code}"
+    return "error", f"unexpected HTTP {r.status_code}"
+
+
+# ════════════════ PLAYWRIGHT FALLBACK ════════════════════════
+
+def _try_playwright(url, subscriber):
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return "error", "Playwright not installed"
 
     try:
-        fields = _detect_fields_pw(page)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", "--disable-gpu", "--single-process",
+            ])
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+            )
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2000)
 
-        if "email" not in fields:
-            # Try scrolling to reveal lazy-loaded forms
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(1500)
-            fields = _detect_fields_pw(page)
+            # Find email field
+            email_sel = None
+            for sel in ['input[type="email"]','input[name*="email" i]',
+                        'input[id*="email" i]','input[placeholder*="email" i]']:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    email_sel = sel; break
 
-        if "email" not in fields:
-            return "skipped", "email field not found on page"
+            if not email_sel:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+                page.wait_for_timeout(1000)
+                for sel in ['input[type="email"]','input[name*="email" i]',
+                            'input[placeholder*="email" i]']:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        email_sel = sel; break
 
-        # Fill email
-        page.fill(fields["email"], subscriber.get("email", ""))
+            if not email_sel:
+                browser.close()
+                return "skipped", "email field not found"
 
-        # Fill name fields if found
-        if "first_name" in fields:
-            page.fill(fields["first_name"], subscriber.get("first_name", ""))
-        if "last_name" in fields:
-            page.fill(fields["last_name"], subscriber.get("last_name", ""))
-        if "name" in fields:
-            full = f"{subscriber.get('first_name','')} {subscriber.get('last_name','')}".strip()
-            page.fill(fields["name"], full)
-        if "phone" in fields:
-            page.fill(fields["phone"], subscriber.get("phone", ""))
+            page.fill(email_sel, subscriber.get("email",""))
 
-        # Click submit
-        btn = _find_submit_button(page)
-        if not btn:
-            return "skipped", "submit button not found"
+            # Fill other fields
+            for sel in ['input[name*="first" i]','input[id*="first" i]']:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    page.fill(sel, subscriber.get("first_name","")); break
+            for sel in ['input[name*="last" i]','input[id*="last" i]']:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    page.fill(sel, subscriber.get("last_name","")); break
+            for sel in ['input[type="tel"]','input[name*="phone" i]']:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    page.fill(sel, subscriber.get("phone","")); break
 
-        # Wait for navigation or response after click
-        url_before = page.url
-        try:
-            with page.expect_response(lambda r: r.status < 400, timeout=10000):
-                btn.click()
-        except PlaywrightTimeout:
-            btn.click()  # click anyway even if no response event
+            # Submit
+            btn = None
+            for sel in ['button[type="submit"]','input[type="submit"]',
+                        'button:has-text("Subscribe")','button:has-text("Sign Up")',
+                        'button:has-text("Join")','button:has-text("Submit")']:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        btn = el; break
+                except: continue
 
-        page.wait_for_timeout(3000)
+            if not btn:
+                browser.close()
+                return "skipped", "submit button not found"
 
-        # Check result
-        body_text = page.inner_text("body").lower()
-        url_after = page.url
+            url_before = page.url
+            btn.click()
+            page.wait_for_timeout(3000)
 
-        for phrase in ALREADY_PHRASES:
-            if phrase in body_text:
-                return "success", "already subscribed"
+            body_text = page.inner_text("body").lower()
+            browser.close()
 
-        for phrase in SUCCESS_PHRASES:
-            if phrase in body_text:
-                return "success", phrase
+            for phrase in ALREADY_PHRASES:
+                if phrase in body_text: return "success", "already subscribed"
+            for phrase in SUCCESS_PHRASES:
+                if phrase in body_text: return "success", phrase
+            for phrase in ERROR_PHRASES:
+                if phrase in body_text: return "rejected", phrase
+            if page.url != url_before: return "success", "redirected after submit"
+            return "success", "submitted"
 
-        for phrase in ERROR_PHRASES:
-            if phrase in body_text:
-                return "rejected", phrase
-
-        if url_after != url_before:
-            return "success", "redirected after submit"
-
-        return "success", "submitted (no explicit confirmation)"
-
-    finally:
-        page.context.close()
-
-
-def _short_label(url):
-    parsed = urlparse(url)
-    return parsed.netloc or url
+    except Exception as e:
+        log.error(f"Playwright error: {e}")
+        return "error", str(e)[:120]
 
 
-# ── local dev ──────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("Running locally at http://localhost:5000")
     app.run(debug=True, port=5000)
