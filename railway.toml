@@ -1,5 +1,5 @@
 [build]
-buildCommand = "pip install -r requirements.txt && playwright install chromium --with-deps"
+buildCommand = "pip install -r requirements.txt"
 
 [deploy]
-startCommand = "PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright gunicorn flask_app:app"
+startCommand = "playwright install chromium --with-deps && gunicorn flask_app:app"
