@@ -1,5 +1,0 @@
-[build]
-buildCommand = "pip install -r requirements.txt"
-
-[deploy]
-startCommand = "playwright install chromium --with-deps && gunicorn flask_app:app --timeout 120 --workers 1"
