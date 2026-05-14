@@ -1,0 +1,14 @@
+libatk1.0-0
+libatk-bridge2.0-0
+libnss3
+libxss1
+libgtk-3-0
+libgbm1
+libx11-xcb1
+libxcomposite1
+libxdamage1
+libxrandr2
+libpango-1.0-0
+libcairo2
+libdrm2
+libxfixes3
